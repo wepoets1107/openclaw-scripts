@@ -76,6 +76,66 @@ Conclusion:
 ====================================
 ```
 
+---
+
+## 使用说明（中文）
+
+```bash
+# 安装依赖
+pip install python-dotenv requests
+
+# 配置凭据
+cp .env.example .env
+# 编辑 .env 填入你的 Deribit API Key 和 Secret
+
+# 预览模式（仅查看，不下单）
+python3 deribit-ddh.py --dry
+
+# 执行对冲（带冷却 + MAX限制）
+python3 deribit-ddh.py
+
+# 强制执行（跳过冷却 & MAX限制）
+python3 deribit-ddh.py --force
+```
+
+## 配置参数
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DEAD` | 1.0 | 死区(ETH)：`\|delta\| ≤ DEAD` 时不操作 |
+| `GAP` | 30 | 冷却间隔(分钟) |
+| `MAX` | 5.0 | 单次最大对冲金额(ETH) |
+| `ALERT` | 50.0 | 总敞口告警阈值 |
+| `DDH_TESTNET` | `true` | `true`=测试网, `false`=主网 |
+
+## 输出示例
+
+```
+====================================
+DDH Data Panel  05-14 21:48
+====================================
+
+Item                           Value
+────────────────────           ────────────────────
+ETH Price                      $2256
+Net Delta                      +0.2461 ETH  ✅ In dead zone
+Gamma                          -0.1044
+Vega                           -340.30
+Theta                          +216.97
+
+Positions:
+  SHORT 26JUN26 1900P ×70  Δ+11.39
+  SHORT 26JUN26 2700C ×100 Δ-18.56
+  ETH-PERPETUAL: LONG 10,001 contracts (≈4.43 ETH)
+
+Conclusion:
+  Net Delta +0.2461 ETH within ±1.0 ETH dead zone. No hedge needed.
+
+====================================
+```
+
+面板说明：Net Delta 在死区 ±1.0 ETH 内则静默，超出则自动对冲并在面板显示执行结果。
+
 ## License
 
 MIT-0
