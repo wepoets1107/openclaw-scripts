@@ -1,331 +1,386 @@
 #!/usr/bin/env python3
 """
-deribit-ETH-DDH-skill — Deribit Delta Dynamic Hedging for ETH options
+Deribit DDH (Delta Dynamic Hedging)
+每8小时检查，超出死区用永续合约配平
 
-Monitors net delta (options + perpetuals) on Deribit and automatically
-hedges ETH-PERPETUAL when delta exceeds the dead zone.
+核心理解：
+- delta_total（来自get_account_summary）= 目标净Delta，单位ETH，已含期权+永续
+- ETH-PERPETUAL = 币本位永续（reversed），amount参数=合约数
+- 1合约 ≈ 1/index_price ETH ≈ $1名义价值
+- 对冲量 = int(|delta_total| × index_price) 合约
 
-Key concepts:
-- delta_total (from get_account_summary) = net delta including options + perpetuals
-- ETH-PERPETUAL = coin-margined perpetual; amount param = number of contracts
-- 1 contract ≈ 1/index_price ETH ≈ $1 notional value
-- Hedge size = int(|delta_total| × index_price) contracts
+⚠️ 铁律（2026-05-14教训留存）：
+- 单位搞错就亏损：币本位永续1合约=$1≠1 ETH，下错单损失几万
+- 冷却30分 + MAX=5.0ETH/笔 是单批限额，超量分多笔执行（2026-05-15更新）
+- 涉及下单操作先跟岛主确认，不擅自主张
+
+⚠️ 铁律（2026-05-14反馈规则）：
+- 每次执行完毕 → 必须输出完整pnl()数据面板，不许省略或只有一行总结
+- print(pnl(...)) 不得被任何逻辑跳过，dry/force/cron 全场景均需输出
 """
 
 import os, sys, json, time, requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from dotenv import load_dotenv
+import threading
 
-# --- Configuration ---
-DEAD = 1.0       # Dead zone (ETH). Net delta within ±DEAD → no action.
-GAP = 30         # Cooldown interval (minutes)
-MAX = 5.0        # Max single hedge amount (ETH)
-ALERT = 50.0     # Total exposure alert threshold (ETH)
-CUR = "ETH"      # Currency
-HD = "ETH-PERPETUAL"  # Hedge instrument
+_script_dir = Path(__file__).parent.parent
+if (_script_dir / ".env").exists(): load_dotenv(_script_dir / ".env")
 
-# Load env vars for API credentials
-load_env = True
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_env = False
+DEAD = 5.0       # 死区(ETH)
+GAP = 30         # 冷却间隔(分钟)
+MAX = 5.0        # 单次最大对冲天(ETH)
+ALERT = 50.0     # 总量告警(ETH)
+CUR = "ETH"; HD = "ETH-PERPETUAL"
+TNET = os.getenv("DDH_TESTNET","true").lower()=="true"
+API = "https://test.deribit.com/api/v2" if TNET else "https://www.deribit.com/api/v2"
+CID = os.getenv("DERIBIT_CLIENT_ID",""); CS = os.getenv("DERIBIT_CLIENT_SECRET","")
+SF = _script_dir / "data" / "ddh-state.json"
 
-_script_dir = Path(__file__).parent
-_env_file = _script_dir / ".env"
-if load_env and _env_file.exists():
-    load_dotenv(_env_file)
-
-# Deribit API
-TESTNET = os.getenv("DDH_TESTNET", "true").lower() == "true"
-API_URL = "https://test.deribit.com/api/v2" if TESTNET else "https://www.deribit.com/api/v2"
-CLIENT_ID = os.getenv("DERIBIT_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("DERIBIT_CLIENT_SECRET", "")
-
-# State file for cooldown tracking
-STATE_FILE = Path(os.getenv("DDH_STATE_FILE", str(_script_dir / "data" / "ddh-state.json")))
-
-
-def log(msg):
-    """Print timestamped log to stderr."""
+def log(m):
     t = datetime.now(timezone(timedelta(hours=8))).strftime("%m-%d %H:%M:%S")
-    print(f"[{t}] {msg}", flush=True, file=sys.stderr)
+    print(f"[{t}] {m}", flush=True, file=sys.stderr)
 
+class C:
+    def __init__(self): self.t,self.e=None,0
+    def r(self,m,p=None):
+        h = {"Authorization":f"Bearer {self.t}"} if self.t else {}
+        r = requests.post(API,json={"jsonrpc":"2.0","id":int(time.time()*1000)%1_000_000,"method":m,"params":p or {}},headers=h,timeout=15).json()
+        if r.get("error"): raise Exception(f"{m}: [{r['error'].get('code','?')}] {r['error'].get('message','?')}")
+        return r["result"]
+    def a(self):
+        if not self.t or time.time()>=self.e:
+            r = self.r("public/auth",{"grant_type":"client_credentials","client_id":CID,"client_secret":CS})
+            self.t,self.e = r["access_token"],time.time()+r["expires_in"]-60
+    def ac(self):
+        self.a(); return self.r("private/get_account_summary",{"currency":CUR})
+    def po(self,k):
+        self.a(); r = self.r("private/get_positions",{"currency":CUR,"kind":k})
+        return r if isinstance(r,list) else []
+    def px(self):
+        return self.r("public/get_index_price",{"index_name":"eth_usd"}).get("index_price",0)
+    def od(self,s,eth_amt,px):
+        self.a()
+        con=int(eth_amt*px)  # ETH→合约
+        if con<1: return None
+        r = self.r(f"private/{'buy' if s=='buy' else 'sell'}",{"instrument_name":HD,"amount":con,"type":"market"})
+        o = r.get("order",r); return {"s":s,"eth":eth_amt,"con":con,"f":o.get("filled_amount",0),"a":o.get("average_price",0)}
 
-class DeribitClient:
-    """Minimal Deribit JSON-RPC client."""
+def ep(ops):
+    r=[]
+    for p in ops:
+        sz = float(p.get("size",0) or 0)
+        if sz==0: continue
+        n=p.get("instrument_name",""); ps=n.split("-")
+        r.append({"e":ps[1] if len(ps)>=2 else "","k":int(ps[2]) if len(ps)>=4 and ps[2].isdigit() else 0,"ot":ps[3] if len(ps)>=4 else "?","sz":sz,"di":p.get("direction","buy"),
+                  "d":float(p.get("delta",0)),"g":float(p.get("gamma",0)),"v":float(p.get("vega",0)),"t":float(p.get("theta",0))})
+    return r
 
-    def __init__(self):
-        self.token = None
-        self.expires = 0
-
-    def _request(self, method, params=None):
-        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
-        resp = requests.post(
-            API_URL,
-            json={
-                "jsonrpc": "2.0",
-                "id": int(time.time() * 1000) % 1_000_000,
-                "method": method,
-                "params": params or {},
-            },
-            headers=headers,
-            timeout=15,
-        ).json()
-        if resp.get("error"):
-            raise Exception(
-                f"{method}: [{resp['error'].get('code', '?')}] "
-                f"{resp['error'].get('message', '?')}"
-            )
-        return resp["result"]
-
-    def _auth(self):
-        if not self.token or time.time() >= self.expires:
-            result = self._request("public/auth", {
-                "grant_type": "client_credentials",
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-            })
-            self.token = result["access_token"]
-            self.expires = time.time() + result["expires_in"] - 60
-
-    def get_account_summary(self):
-        self._auth()
-        return self._request("private/get_account_summary", {"currency": CUR})
-
-    def get_positions(self, kind):
-        self._auth()
-        result = self._request("private/get_positions", {
-            "currency": CUR, "kind": kind
-        })
-        return result if isinstance(result, list) else []
-
-    def get_index_price(self):
-        return self._request("public/get_index_price", {
-            "index_name": "eth_usd"
-        }).get("index_price", 0)
-
-    def place_market_order(self, side, eth_amount, index_price):
-        """Place market order on ETH-PERPETUAL.
-        
-        Args:
-            side: 'buy' or 'sell'
-            eth_amount: amount in ETH
-            index_price: current index price
-            
-        Returns:
-            dict with order details or None if size < 1 contract
-        """
-        self._auth()
-        contracts = int(eth_amount * index_price)  # ETH → contracts
-        if contracts < 1:
-            return None
-
-        method = "private/buy" if side == "buy" else "private/sell"
-        result = self._request(method, {
-            "instrument_name": HD,
-            "amount": contracts,
-            "type": "market",
-        })
-        order = result.get("order", result)
-        return {
-            "side": side,
-            "eth": eth_amount,
-            "contracts": contracts,
-            "filled": order.get("filled_amount", 0),
-            "avg_price": order.get("average_price", 0),
-        }
-
-
-def parse_options(positions):
-    """Extract greeks from option positions."""
-    parsed = []
-    for p in positions:
-        size = float(p.get("size", 0) or 0)
-        if size == 0:
-            continue
-        name = p.get("instrument_name", "")
-        parts = name.split("-")
-        parsed.append({
-            "expiry": parts[1] if len(parts) >= 2 else "",
-            "strike": int(parts[2]) if len(parts) >= 4 and parts[2].isdigit() else 0,
-            "option_type": parts[3] if len(parts) >= 4 else "?",
-            "size": size,
-            "direction": p.get("direction", "buy"),
-            "delta": float(p.get("delta", 0)),
-            "gamma": float(p.get("gamma", 0)),
-            "vega": float(p.get("vega", 0)),
-            "theta": float(p.get("theta", 0)),
-        })
-    return parsed
-
-
-def panel(timestamp, index_price, greeks, option_positions,
-          perp_contracts, perp_eth, action=None, delta_after=None):
-    """Generate a formatted data panel for output."""
-    net_delta = greeks["delta"]
-    nd_after = delta_after if delta_after is not None else net_delta
-
-    lines = []
-    lines.append("=" * 36)
-    lines.append(f"DDH Data Panel  {timestamp}")
-    lines.append("=" * 36)
-    lines.append("")
-    lines.append(f"{'Item':<20} {'Value'}")
-    lines.append(f"{'─'*20} {'─'*20}")
-    lines.append(f"{'ETH Price':<20} ${index_price:.0f}")
-    status = "✅ In dead zone" if abs(net_delta) <= DEAD else "⚠️ Exceeds dead zone"
-    lines.append(f"{'Net Delta':<20} {net_delta:+.4f} ETH  {status}")
-    lines.append(f"{'Gamma':<20} {greeks['gamma']:+.4f}")
-    lines.append(f"{'Vega':<20} {greeks['vega']:+.2f}")
-    lines.append(f"{'Theta':<20} {greeks['theta']:+.2f}")
-    if delta_after is not None and delta_after != net_delta:
-        lines.append(f"{'After Delta':<20} {nd_after:+.4f} ETH")
-    lines.append("")
-
-    lines.append("Positions:")
-    for d in option_positions:
-        lbl = "SHORT" if d["direction"] == "sell" else "LONG"
-        lines.append(
-            f"  {lbl} {d['expiry']} {d['strike']}{d['option_type']} "
-            f"×{int(abs(d['size']))}  Δ{d['delta']:+.2f}"
-        )
-    perp_side = "LONG" if perp_contracts > 0 else ("SHORT" if perp_contracts < 0 else "NONE")
-    lines.append(f"  {HD}: {perp_side} {abs(perp_contracts):,.0f} contracts "
-                 f"(≈{abs(perp_eth):.2f} ETH)")
-    lines.append("")
-
-    lines.append("Conclusion:")
-    if abs(nd_after) <= DEAD:
-        lines.append(
-            f"  Net Delta {nd_after:+.4f} ETH within ±{DEAD} ETH dead zone. "
-            f"No hedge needed."
-        )
+def pnl(ts,px,g0,pos,ppc,ppeth,act=None,nda=None):
+    """面板 — 微信友好：表格简洁直观"""
+    nd = g0["d"]
+    nd_after = nda if nda is not None else nd
+    L=[]
+    L.append("="*36)
+    L.append(f"🦐 DDH 数据面板  {ts}")
+    L.append("="*36)
+    L.append("")
+    # 1) ETH价格 + Greeks表格
+    L.append(f"| 项目 | 数值 |")
+    L.append(f"|------|------|")
+    L.append(f"| ETH 价格 | ${px:.0f} |")
+    L.append(f"| **Net Delta** | **{nd:+.4f} ETH** {'✅ 死区内' if abs(nd)<=DEAD else '⚠️ 超死区'} |")
+    L.append(f"| Gamma | {g0['g']:+.4f} |")
+    L.append(f"| Vega | {g0['v']:+.2f} |")
+    L.append(f"| Theta | {g0['t']:+.2f} |")
+    if nda is not None and nda != nd:
+        L.append(f"| After Delta | {nd_after:+.4f} ETH |")
+    L.append("")
+    # 2) 持仓
+    L.append("**持仓：**")
+    if pos:
+        for d in pos:
+            lbl="空" if d["di"]=="sell" else "多"
+            L.append(f"- {lbl} {d['e']} {d['k']}{d['ot']} ×{int(abs(d['sz']))} — Δ{d['d']:+.2f}")
+    pl="多头" if ppc>0 else ("空头" if ppc<0 else "无")
+    L.append(f"- 永续 {HD}：{pl} {abs(ppc):,.0f}合约（≈{abs(ppeth):.2f} ETH）")
+    L.append("")
+    # 3) 结论
+    L.append("**结论：**")
+    if abs(nd_after)<=DEAD:
+        L.append(f"Net Delta {nd_after:+.4f} ETH，在死区 ±{DEAD} ETH 范围内，无需对冲。静默。")
     else:
-        lines.append(
-            f"  Net Delta {nd_after:+.4f} ETH exceeds ±{DEAD} ETH dead zone. "
-            f"Hedge {abs(nd_after):.4f} ETH ≈ {int(abs(nd_after) * index_price)} contracts."
-        )
-    if abs(net_delta) > ALERT:
-        lines.append(f"  🚨 Total exposure exceeds {ALERT} ETH threshold!")
-
-    if action:
-        if action.get("dry_run"):
-            lines.append(
-                f"  [Dry-run] Would {'SELL' if action['side'] == 'sell' else 'BUY'} "
-                f"{action['eth']:.4f} ETH ({action['contracts']} contracts)"
-            )
+        L.append(f"Net Delta {nd_after:+.4f} ETH，超出死区 ±{DEAD} ETH，需对冲 {abs(nd_after):.4f} ETH ≈ {int(abs(nd_after)*px)} 合约。")
+    if abs(nd)>ALERT:
+        L.append(f"🚨 总敞口超上限 {ALERT} ETH！")
+    if act:
+        if act.get("dr"):
+            L.append(f"[仿真] 拟{'做空' if act['s']=='sell' else '做多'} {act['eth']:.4f} ETH（{act['con']}合约）")
         else:
-            avg = action.get("avg_price", 0) or 0
-            lbl = "SHORT" if action["side"] == "sell" else "LONG"
-            lines.append(
-                f"  [Executed] {lbl} {action['eth']:.4f} ETH @ ${avg:.1f} "
-                f"({action['contracts']} contracts)"
-            )
-
-    lines.append("")
-    lines.append("=" * 36)
-    return "\n".join(lines)
-
+            lb="做空" if act["s"]=="sell" else "做多"; a=act.get("a",0) or 0
+            L.append(f"[执行] {lb} {act['eth']:.4f} ETH @ ${a:.1f}（{act['con']}合约）")
+    L.append("")
+    L.append("="*36)
+    L.append("=== 面板结束 ===")
+    return "\n".join(L)
 
 def main():
-    """Main DDH loop."""
-    dry_run = "--dry" in sys.argv
-    force = "--force" in sys.argv  # Skip cooldown & MAX limit
-
-    timestamp = datetime.now(timezone(timedelta(hours=8))).strftime("%m-%d %H:%M")
-
-    if not CLIENT_ID or not CLIENT_SECRET:
-        log("ERROR: DERIBIT_CLIENT_ID / DERIBIT_CLIENT_SECRET not set")
-        return
-
-    client = DeribitClient()
-
+    dr="--dry" in sys.argv
+    fc="--force" in sys.argv  # 岛主指令，跳过冷却和MAX
+    ts=datetime.now(timezone(timedelta(hours=8))).strftime("%m-%d %H:%M")
+    if not CID or not CS: return
+    cl=C()
     try:
-        # Fetch data
-        index_price = client.get_index_price()
-        log(f"ETH ${index_price:.2f}")
+        px=cl.px(); log(f"ETH ${px:.2f}")
+        ac=cl.ac()
+        g={"d":ac.get("delta_total",0)or 0,"g":ac.get("options_gamma",0)or 0,
+           "v":ac.get("options_vega",0)or 0,"t":ac.get("options_theta",0)or 0}
+        pos=ep(cl.po("option"))
+        sw=[p for p in cl.po("future") if "PERPETUAL" in p.get("instrument_name","")]
 
-        acct = client.get_account_summary()
-        greeks = {
-            "delta": float(acct.get("delta_total", 0) or 0),
-            "gamma": float(acct.get("options_gamma", 0) or 0),
-            "vega": float(acct.get("options_vega", 0) or 0),
-            "theta": float(acct.get("options_theta", 0) or 0),
-        }
+        # 永续持仓（合约数 + ETH实际值）
+        ppc=sum(float(p.get("size",0)or 0) for p in sw)
+        ppeth=sum(float(p.get("size_currency",0)or 0) for p in sw)
 
-        option_positions = parse_options(client.get_positions("option"))
+        nd=g["d"]  # delta_total IS net delta
+        log(f"Net Delta={nd:+.4f} ETH  永续={ppeth:+.4f}ETH ({ppc:.0f}合约)")
 
-        perp_positions = [
-            p for p in client.get_positions("future")
-            if "PERPETUAL" in p.get("instrument_name", "")
-        ]
-        perp_contracts = sum(float(p.get("size", 0) or 0) for p in perp_positions)
-        perp_eth = sum(float(p.get("size_currency", 0) or 0) for p in perp_positions)
+        act,nda=None,None
+        skp=False
 
-        net_delta = greeks["delta"]
-        log(f"Net Delta={net_delta:+.4f} ETH  Perpetual={perp_eth:+.4f} ETH "
-            f"({perp_contracts:.0f} contracts)")
+        if abs(nd)>DEAD:
+            # 冷却检查（--force跳过）
+            if not fc and SF.exists():
+                try:
+                    st=json.loads(SF.read_text())
+                    el=(time.time()-st.get("t",0))/60
+                    if el<GAP:
+                        log(f"冷却中({el:.0f}/{GAP}分)")
+                        skp=True
+                except: pass
 
-        # Cooldown check
-        skip = False
-        if abs(net_delta) > DEAD and not force and STATE_FILE.exists():
-            try:
-                state = json.loads(STATE_FILE.read_text())
-                elapsed = (time.time() - state.get("t", 0)) / 60
-                if elapsed < GAP:
-                    log(f"Cooldown active ({elapsed:.0f}/{GAP} min)")
-                    skip = True
-            except Exception:
-                pass
+        if abs(nd)>DEAD and not skp:
+            # 分批对冲：超过MAX/笔则拆单，直到delta归零
+            orders=[]
+            cd=nd
+            batch_max=MAX if not fc else 999
 
-        action = None
-        delta_after = None
+            while abs(cd)>DEAD*0.1:
+                sd="sell" if cd>0 else "buy"  # 每轮根据实时delta方向定
+                batch=min(abs(cd), batch_max)
+                con=int(batch*px)
+                if con<1:
+                    log(f"末笔<1合约跳过({batch:.4f}ETH×${px:.0f}={con})")
+                    break
 
-        if abs(net_delta) > DEAD and not skip:
-            eth_amount = abs(net_delta)
-            if not force and eth_amount > MAX:
-                eth_amount = MAX
-                log(f"Capped at {eth_amount:.4f} ETH (≤ {MAX} ETH)")
-
-            contracts = int(eth_amount * index_price)
-            if contracts < 1:
-                log(f"Hedge too small: {eth_amount:.4f} ETH × ${index_price:.0f} = {contracts} contracts")
-            else:
-                side = "sell" if net_delta > 0 else "buy"
-
-                if dry_run:
-                    action = {
-                        "side": side, "eth": eth_amount,
-                        "contracts": contracts, "dry_run": True,
-                    }
+                if dr:
+                    orders.append({"dr":True,"s":sd,"eth":batch,"con":con})
+                    cd+=batch if sd=="buy" else -batch
                 else:
-                    result = client.place_market_order(side, eth_amount, index_price)
-                    if result and result.get("filled", 0) > 0:
-                        action = result
+                    r=cl.od(sd,batch,px)
+                    if r and r.get("f",0)>0:
+                        r["s"]=sd; orders.append(r)
                         time.sleep(1)
-                        acct2 = client.get_account_summary()
-                        delta_after = float(acct2.get("delta_total", 0) or 0)
-                        log(f"Post-hedge Net Delta={delta_after:+.4f}")
+                        ac2=cl.ac()
+                        cd=ac2.get("delta_total",0)or 0
+                        sw2=[p for p in cl.po("future") if "PERPETUAL" in p.get("instrument_name","")]
+                        ppc=sum(float(p.get("size",0)or 0) for p in sw2)
+                        ppeth=sum(float(p.get("size_currency",0)or 0) for p in sw2)
+                        log(f"第{len(orders)}笔: {sd} {batch:.4f}ETH | delta残={cd:+.4f}")
+                    else:
+                        log(f"第{len(orders)+1}笔下单失败")
+                        break
 
-                        # Save cooldown timestamp (only for cron, not force)
-                        if not force:
-                            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-                            STATE_FILE.write_text(json.dumps({"t": time.time()}))
+            if orders:
+                nda=cd
+                act=orders[-1]
+                total_eth=sum(o.get("eth",0) or 0 for o in orders)
+                log(f"分批对冲完成: {len(orders)}笔, 共约{total_eth:.4f}ETH")
+                if not fc and not dr:
+                    SF.parent.mkdir(parents=True,exist_ok=True)
+                    SF.write_text(json.dumps({"t":time.time()}))
 
-        # Always output the data panel
-        output = panel(
-            timestamp, index_price, greeks,
-            option_positions, perp_contracts, perp_eth,
-            action, delta_after,
-        )
-        print(output)
+        # 每次执行都打印面板
+        print(pnl(ts,px,g,pos,ppc,ppeth,act,nda))
+        if not act:
+            log(f"Net Delta {nd:+.4f} {'死区内' if abs(nd)<=DEAD else '超死区'}，静默")
 
     except Exception as e:
-        log(f"Error: {e}")
-        import traceback
-        traceback.print_exc(file=sys.stderr)
+        log(f"异常: {e}")
+        import traceback; traceback.print_exc(file=sys.stderr)
+
+def main_ws():
+    """WebSocket实时监控模式 — 常驻进程，秒级检测delta"""
+    import websocket
+    
+    dr="--dry" in sys.argv
+    fc="--force" in sys.argv
+    
+    if not CID or not CS:
+        log("❌ 缺少API Key")
+        return
+    
+    WS_URL = "wss://test.deribit.com/ws/api/v2" if TNET else "wss://www.deribit.com/ws/api/v2"
+    cl = C()
+    
+    # 首次获取完整数据（用于面板）
+    def refresh_snapshot():
+        try:
+            px = cl.px()
+            ac = cl.ac()
+            g = {"d":ac.get("delta_total",0)or 0,"g":ac.get("options_gamma",0)or 0,
+                 "v":ac.get("options_vega",0)or 0,"t":ac.get("options_theta",0)or 0}
+            pos = ep(cl.po("option"))
+            sw = [p for p in cl.po("future") if "PERPETUAL" in p.get("instrument_name","")]
+            ppc = sum(float(p.get("size",0)or 0) for p in sw)
+            ppeth = sum(float(p.get("size_currency",0)or 0) for p in sw)
+            return px, g, pos, ppc, ppeth
+        except Exception as e:
+            log(f"快照刷新异常: {e}")
+            return None, None, None, None, None
+
+    # 对冲执行（复用REST逻辑）
+    def do_hedge(nd, px, g, pos, ppc, ppeth):
+        orders = []
+        cd = nd
+        batch_max = MAX if not fc else 999
+        ts = datetime.now(timezone(timedelta(hours=8))).strftime("%m-%d %H:%M")
+
+        while abs(cd) > DEAD * 0.1:
+            sd = "sell" if cd > 0 else "buy"
+            batch = min(abs(cd), batch_max)
+            con = int(batch * px)
+            if con < 1:
+                log(f"末笔<1合约跳过({batch:.4f}ETH×${px:.0f}={con})")
+                break
+
+            if dr:
+                orders.append({"dr":True,"s":sd,"eth":batch,"con":con})
+                cd += batch if sd == "buy" else -batch
+            else:
+                r = cl.od(sd, batch, px)
+                if r and r.get("f",0) > 0:
+                    r["s"] = sd; orders.append(r)
+                    time.sleep(1)
+                    ac2 = cl.ac()
+                    cd = ac2.get("delta_total",0) or 0
+                    sw2 = [p for p in cl.po("future") if "PERPETUAL" in p.get("instrument_name","")]
+                    ppc = sum(float(p.get("size",0)or 0) for p in sw2)
+                    ppeth = sum(float(p.get("size_currency",0)or 0) for p in sw2)
+                    log(f"第{len(orders)}笔: {sd} {batch:.4f}ETH | delta残={cd:+.4f}")
+                else:
+                    log(f"第{len(orders)+1}笔下单失败")
+                    break
+
+        if orders:
+            act = orders[-1]
+            total_eth = sum(o.get("eth",0) or 0 for o in orders)
+            log(f"分批对冲完成: {len(orders)}笔, 共约{total_eth:.4f}ETH")
+            if not fc and not dr:
+                SF.parent.mkdir(parents=True,exist_ok=True)
+                SF.write_text(json.dumps({"t":time.time()}))
+            # 刷新快照后打印面板
+            snap = refresh_snapshot()
+            if snap[0]:
+                print(pnl(ts, snap[0], snap[1], snap[2], snap[3], snap[4], act, cd))
+        else:
+            print(pnl(ts, px, g, pos, ppc, ppeth, None, nd))
+
+    # 初始快照
+    snap = refresh_snapshot()
+    if not snap[0]:
+        log("❌ 初始快照失败，退出")
+        return
+    px, g, pos, ppc, ppeth = snap
+    nd = g["d"]
+    ts = datetime.now(timezone(timedelta(hours=8))).strftime("%m-%d %H:%M")
+    print(pnl(ts, px, g, pos, ppc, ppeth))
+    log(f"WS模式启动 | 初始delta={nd:+.4f} | 死区±{DEAD} | 每笔上限{MAX}ETH")
+
+    # 如果初始delta已超死区，先对冲
+    if abs(nd) > DEAD:
+        log(f"初始delta超死区，立即对冲")
+        do_hedge(nd, px, g, pos, ppc, ppeth)
+
+    # WebSocket连接循环
+    while True:
+        try:
+            ws = websocket.WebSocket()
+            ws.connect(WS_URL, timeout=30)
+            log(f"WS已连接 {WS_URL}")
+
+            # 认证
+            auth_req = json.dumps({"jsonrpc":"2.0","id":1,"method":"public/auth",
+                "params":{"grant_type":"client_credentials","client_id":CID,"client_secret":CS}})
+            ws.send(auth_req)
+            auth_resp = json.loads(ws.recv())
+            if auth_resp.get("error"):
+                log(f"WS认证失败: {auth_resp['error']}")
+                ws.close()
+                time.sleep(10)
+                continue
+            log("WS认证成功")
+
+            # 订阅portfolio
+            sub_req = json.dumps({"jsonrpc":"2.0","id":2,"method":"private/subscribe",
+                "params":{"channels":["user.portfolio.eth"]}})
+            ws.send(sub_req)
+            sub_resp = json.loads(ws.recv())
+            log(f"WS订阅结果: {sub_resp.get('result','?')}")
+
+            # 消息循环
+            ws.settimeout(30)  # 30秒无消息则发ping
+            while True:
+                try:
+                    msg = ws.recv()
+                    if not msg:
+                        break
+                    data = json.loads(msg)
+                    # 只处理portfolio推送
+                    if data.get("params",{}).get("channel") == "user.portfolio.eth":
+                        pdata = data["params"]["data"]
+                        nd_new = pdata.get("delta_total", 0) or 0
+                        px_new = pdata.get("index_price", 0) or px
+                        # 更新greeks
+                        g_new = {"d": nd_new,
+                                 "g": pdata.get("options_gamma", 0) or 0,
+                                 "v": pdata.get("options_vega", 0) or 0,
+                                 "t": pdata.get("options_theta", 0) or 0}
+                        
+                        if abs(nd_new) > DEAD:
+                            log(f"⚠️ delta={nd_new:+.4f} 超死区，触发对冲")
+                            # 刷新完整快照后对冲
+                            snap = refresh_snapshot()
+                            if snap[0]:
+                                do_hedge(snap[1]["d"], snap[0], snap[1], snap[2], snap[3], snap[4])
+                            # 对冲后刷新面板
+                            snap = refresh_snapshot()
+                            if snap[0]:
+                                px, g, pos, ppc, ppeth = snap
+                                ts = datetime.now(timezone(timedelta(hours=8))).strftime("%m-%d %H:%M")
+                                print(pnl(ts, px, g, pos, ppc, ppeth))
+                        else:
+                            # 更新缓存数据
+                            px = px_new
+                            g = g_new
+                except websocket.WebSocketTimeoutException:
+                    # 发ping保活
+                    try:
+                        ws.ping()
+                    except:
+                        break
+                except json.JSONDecodeError:
+                    continue
+
+        except Exception as e:
+            log(f"WS异常: {e}，10秒后重连")
+            time.sleep(10)
+            continue
 
 
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":
+    if "--ws" in sys.argv:
+        main_ws()
+    else:
+        main()
